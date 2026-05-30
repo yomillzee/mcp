@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -157,47 +158,45 @@ def upsert_account_daily(
     client = build_client(pid)
     ensure_table(client, pid, ds, "metrics_account_daily", METRICS_ACCOUNT_DAILY_SCHEMA)
 
-    table_ref = f"`{pid}.{ds}.metrics_account_daily`"
-    merge_sql = f"""
-        MERGE {table_ref} AS T
-        USING UNNEST(@rows) AS S
-        ON T.account_id = S.account_id AND T.metric_date = S.metric_date
-        WHEN MATCHED THEN UPDATE SET
-          spend = S.spend,
-          clicks = S.clicks,
-          impressions = S.impressions,
-          conversions = S.conversions,
-          conversion_value = S.conversion_value,
-          synced_at = S.synced_at
-        WHEN NOT MATCHED THEN INSERT (
-          account_id, metric_date, spend, clicks, impressions, conversions, conversion_value, synced_at
-        ) VALUES (
-          S.account_id, S.metric_date, S.spend, S.clicks, S.impressions, S.conversions, S.conversion_value, S.synced_at
+    staging_id = f"_staging_{uuid.uuid4().hex[:12]}"
+    staging_ref = f"{pid}.{ds}.{staging_id}"
+    staging_table = bigquery.Table(staging_ref, schema=METRICS_ACCOUNT_DAILY_SCHEMA)
+    client.create_table(staging_table, exists_ok=True)
+
+    try:
+        load_job = client.load_table_from_json(
+            normalized,
+            staging_ref,
+            job_config=bigquery.LoadJobConfig(
+                schema=METRICS_ACCOUNT_DAILY_SCHEMA,
+                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            ),
         )
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ArrayQueryParameter(
-                "rows",
-                "STRUCT<account_id STRING, metric_date DATE, spend FLOAT64, clicks INT64, "
-                "impressions INT64, conversions FLOAT64, conversion_value FLOAT64, synced_at TIMESTAMP>",
-                [
-                    {
-                        "account_id": r["account_id"],
-                        "metric_date": r["metric_date"],
-                        "spend": r["spend"],
-                        "clicks": r["clicks"],
-                        "impressions": r["impressions"],
-                        "conversions": r["conversions"],
-                        "conversion_value": r["conversion_value"],
-                        "synced_at": r["synced_at"],
-                    }
-                    for r in normalized
-                ],
+        load_job.result()
+
+        merge_sql = f"""
+            MERGE `{pid}.{ds}.metrics_account_daily` AS T
+            USING `{staging_ref}` AS S
+            ON T.account_id = S.account_id AND T.metric_date = S.metric_date
+            WHEN MATCHED THEN UPDATE SET
+              spend = S.spend,
+              clicks = S.clicks,
+              impressions = S.impressions,
+              conversions = S.conversions,
+              conversion_value = S.conversion_value,
+              synced_at = S.synced_at
+            WHEN NOT MATCHED THEN INSERT (
+              account_id, metric_date, spend, clicks, impressions, conversions,
+              conversion_value, synced_at
+            ) VALUES (
+              S.account_id, S.metric_date, S.spend, S.clicks, S.impressions, S.conversions,
+              S.conversion_value, S.synced_at
             )
-        ]
-    )
-    client.query(merge_sql, job_config=job_config).result()
+        """
+        client.query(merge_sql).result()
+    finally:
+        client.delete_table(staging_ref, not_found_ok=True)
+
     return len(normalized)
 
 
